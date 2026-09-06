@@ -1,0 +1,551 @@
+# ============================================================================
+# MOD_01_ACCESO — Especificación completa para revisión por agentes de IA
+# Objetivo de este documento: que otro agente pueda evaluar el diseño
+# completo (no solo algoritmos aislados) y encontrar fallas de flujo,
+# de dependencia externa, o de contrato entre módulos.
+# ============================================================================
+
+module:
+  id: MOD_01_ACCESO
+  name: "Acceso"
+  purpose: >
+    Autenticación (Local y Google) y autorización (RBAC) para dos tipos de
+    actor: CLIENTE y USUARIO_INTERNO. No posee datos de negocio de ninguno
+    de los dos actores, ni el catálogo de roles/permisos, ni el registro
+    de auditoría.
+
+  owns_tables:
+    - name: tbl_usr_usuarios
+      purpose: "Credencial de acceso: password hasheada, MFA, estado de aprobación"
+    - name: tbl_usr_proveedores_auth
+      purpose: "Vinculación con cuentas de Google"
+    - name: tbl_ses_sesiones
+      purpose: "Sesiones activas/históricas, control de refresh tokens"
+    - name: tbl_tok_tokens_seguridad
+      purpose: "Tokens de un solo uso: verificación de email, reset de password"
+
+  references_external_tables:
+    - table_owner: MOD_02_CUENTA_DEL_CLIENTE
+      referenced_as: usr_id_actor_externo (cuando usr_tipo_actor = 'CLIENTE')
+      relation_type: referencia_opaca_sin_fk_fisica
+    - table_owner: MOD_22_PANEL_DE_ADMINISTRACION_Y_PERMISOS
+      referenced_as: usr_id_actor_externo (cuando usr_tipo_actor = 'USUARIO_INTERNO')
+      relation_type: referencia_opaca_sin_fk_fisica
+    - table_owner: MOD_22_PANEL_DE_ADMINISTRACION_Y_PERMISOS
+      referenced_as: rol_id_rol
+      relation_type: referencia_opaca_sin_fk_fisica
+    - table_owner: COMPONENTE_AUDITORIA_INDEPENDIENTE
+      referenced_as: "no se referencia por FK — solo se emite evento"
+      relation_type: evento_asincrono
+
+  actors:
+    - id: CLIENTE
+      description: "Comprador del ecommerce. Puede o no tener credencial en este módulo (checkout de invitado no crea credencial)."
+    - id: USUARIO_INTERNO
+      description: "Empleado que opera el panel de administración. Siempre tiene credencial."
+    - id: VISITANTE_ANONIMO
+      description: "Sin representación en este módulo. No genera ninguna fila hasta que decide registrarse o loguearse."
+
+  external_dependencies:
+    - name: Google OAuth2
+      type: llamada_de_red_a_proveedor_externo
+      nature: sincrona_bloqueante
+      used_in_algorithms: [MOD01-ALG03, MOD01-ALG05]
+      failure_mode: "si Google no responde o el token es inválido, se rechaza con AUTENTICACION_GOOGLE_FALLIDA — no hay reintento automático documentado, queda como decisión de implementación"
+    - name: Redis
+      type: infraestructura_interna_no_relacional
+      nature: sincrona_baja_latencia
+      used_for: [rate_limiting_contador, mfa_challenge_token, blacklist_jti_logout]
+    - name: Servicio de envío de email
+      type: dependencia_externa_asincrona
+      used_in_algorithms: [MOD01-ALG01, MOD01-ALG10a, MOD01-ALG11]
+      nature: "este módulo dispara el evento, no espera confirmación de entrega — fire and forget"
+
+  called_by:
+    - module: MOD_02_CUENTA_DEL_CLIENTE
+      invokes: [MOD01-ALG01, MOD01-ALG02, MOD01-ALG03]
+      when: "un Cliente decide crear credencial de acceso (puede ser en el momento de comprar por primera vez, o después de haber comprado como invitado)"
+    - module: MOD_22_PANEL_DE_ADMINISTRACION_Y_PERMISOS
+      invokes: [MOD01-ALG01, MOD01-ALG13]
+      when: "alta de un Usuario Interno nuevo, o desactivación de una cuenta existente"
+    - module: cualquier_modulo_protegido (MOD_CATALOGO, MOD_CHECKOUT, etc.)
+      invokes: [MOD01-ALG08]
+      when: "en cada request que llegue con un Access Token, para validar autenticidad del token — la decisión de PERMISO_INSUFICIENTE la toma el módulo llamante, no este módulo"
+
+  emits_events_to:
+    - target: MOD_NOTIFICACIONES
+      events: [usuario.registrado, usuario.email_verificado, usuario.reset_password_solicitado, usuario.sesion_comprometida_detectada]
+    - target: MOD_CARRITO
+      events: [sesion.convertida_en_usuario]
+    - target: COMPONENTE_AUDITORIA_INDEPENDIENTE
+      events: [auditoria.evento_registrado]
+
+  receives_events_from:
+    - source: MOD_22_PANEL_DE_ADMINISTRACION_Y_PERMISOS
+      event: usuario.desactivado
+      triggers: MOD01-ALG13
+
+  known_design_tradeoffs:
+    - id: TRADEOFF-001
+      description: >
+        Cambios de rol (ascenso o descenso de permisos) no se reflejan en un
+        Access Token ya emitido hasta su expiración natural (máx. 15 min) o
+        renovación. Aceptado como trade-off estándar de industria para JWT
+        stateless — mitigado con TTL corto, no eliminado.
+      affects_algorithms: [MOD01-ALG06]
+    - id: TRADEOFF-002
+      description: >
+        La revocación por desactivación de cuenta (MOD01-ALG13) no puede
+        garantizar invalidación instantánea del Access Token si no se conoce
+        su jti — solo garantiza que no pueda renovarse. Limitación inherente
+        a JWT sin consulta a base de datos en cada request.
+      affects_algorithms: [MOD01-ALG13]
+
+# ============================================================================
+# ALGORITMOS
+# ============================================================================
+
+algorithms:
+
+  - algorithm_id: MOD01-ALG01
+    name: registrarUsuarioLocal
+    resolution_type: interno_completo
+    called_by: [MOD_02_CUENTA_DEL_CLIENTE, MOD_22_PANEL_DE_ADMINISTRACION_Y_PERMISOS]
+    is_public_endpoint: false
+    note_llamador: "no es un endpoint público autónomo — se invoca como servicio interno con el actor y su ID ya resueltos por quien llama"
+    inputs:
+      - { name: email, type: string, required: true }
+      - { name: password, type: string, required: true }
+      - { name: usr_tipo_actor, type: enum[CLIENTE, USUARIO_INTERNO], required: true }
+      - { name: usr_id_actor_externo, type: uuid, required: true }
+    steps:
+      - id: 1
+        action: normalize_email
+      - id: 2
+        action: check_uniqueness
+        target: tbl_usr_usuarios.usr_email
+        on_conflict: { http: 409, error_code: EMAIL_YA_REGISTRADO }
+      - id: 3
+        action: validate_password_policy
+        min_length: 10
+        check_breach_list: true
+        on_fail: { http: 400, error_code: PASSWORD_INSEGURA }
+      - id: 4
+        action: hash_password
+        algorithm: argon2id
+        params: { memory_kib: 65536, time_cost: 3, parallelism: 4, salt_bytes: 16 }
+      - id: 5
+        action: insert
+        target: tbl_usr_usuarios
+      - id: 6
+        action: generate_token
+        token_type: VERIFICACION_EMAIL
+        ttl_hours: 24
+        emit_event: usuario.registrado
+        external_dependency: Servicio de envío de email
+      - id: 7
+        action: emit_audit
+        tipo_evento: REGISTRO_LOCAL
+      - id: 8
+        action: conditional
+        condition: "CFG_LOGIN_AUTOMATICO_POST_REGISTRO == true"
+        if_true: { call: MOD01-ALG02 }
+        if_false: { response: { http: 201, tokens: null } }
+    outputs:
+      success: { http: 201, or_tokens_if_auto_login: true }
+      errors: [EMAIL_YA_REGISTRADO, PASSWORD_INSEGURA]
+    traceable_requirements: [REQ-ACC-001, REQ-ACC-002, REQ-ACC-003, REQ-ACC-004, REQ-ACC-005, REQ-ACC-006]
+
+  - algorithm_id: MOD01-ALG02
+    name: autenticarLocal
+    resolution_type: interno_completo
+    called_by: [MOD01-ALG01 (condicional), cliente_o_frontend_directamente]
+    is_public_endpoint: true
+    external_dependency_in_flow: Redis (rate limiting, no bloqueante)
+    inputs:
+      - { name: email, type: string, required: true }
+      - { name: password, type: string, required: true }
+    steps:
+      - id: 1
+        action: check_rate_limit
+        backend: redis
+        limit: "5 per 15min por IP y por email"
+        on_fail: { http: 429, error_code: TOO_MANY_REQUESTS }
+      - id: 2
+        action: query_user
+        on_not_found: { http: 401, error_code: CREDENCIALES_INVALIDAS, increment_redis_counter: true }
+      - id: 3
+        action: check_null
+        field: usr_hash_password
+        on_null: { http: 401, error_code: CREDENCIALES_INVALIDAS }
+      - id: 4
+        action: verify_hash
+        algorithm: argon2id
+        on_fail: { http: 401, error_code: CREDENCIALES_INVALIDAS, increment_redis_counter: true }
+      - id: 5
+        action: switch_estado
+        cases:
+          RECHAZADO: { http: 403, error_code: CUENTA_RECHAZADA }
+          PENDIENTE_B2B: { condition: "CFG_MODULO_B2B_ACTIVO", http: 403, error_code: CUENTA_PENDIENTE_DE_APROBACION }
+          APROBADO: { continue: true }
+      - id: 6
+        action: check_email_verified
+        condition_flag: CFG_EMAIL_VERIFICADO_OBLIGATORIO_LOGIN
+        on_fail: { http: 403, error_code: EMAIL_NO_VERIFICADO }
+      - id: 7
+        action: check_mfa_required
+        on_true:
+          call: [generate_mfa_challenge]
+          response: { http: 200, body: { requiere_mfa: true } }
+          halts_flow: true
+          continues_in: MOD01-ALG04
+      - id: 8
+        action: issue_tokens
+        access_token: { ttl_min: 15, algorithm: RS256 }
+        refresh_token: { ttl_days: 7 }
+        side_effects: [reset_redis_counter, update_last_login, insert_session, emit_audit(LOGIN_LOCAL), call_if_applicable(MOD01-ALG07)]
+        response: { http: 200 }
+    outputs:
+      success: { http: 200, tokens: [access_token, refresh_token] }
+      errors: [CREDENCIALES_INVALIDAS, CUENTA_RECHAZADA, CUENTA_PENDIENTE_DE_APROBACION, EMAIL_NO_VERIFICADO, TOO_MANY_REQUESTS]
+    traceable_requirements: [REQ-ACC-007, REQ-ACC-008, REQ-ACC-009, REQ-ACC-010, REQ-ACC-011]
+
+  - algorithm_id: MOD01-ALG03
+    name: autenticarGoogle
+    resolution_type: depende_de_respuesta_externa
+    external_dependency: Google OAuth2
+    condition_to_exist: "CFG_AUTENTICACION_GOOGLE == true"
+    called_by: [cliente_o_frontend_directamente]
+    is_public_endpoint: true
+    inputs:
+      - { name: token_oauth, type: string, required: true }
+    steps:
+      - id: 1
+        action: validate_external
+        provider: google
+        on_fail: { http: 401, error_code: AUTENTICACION_GOOGLE_FALLIDA }
+      - id: 2
+        action: lookup_vinculacion
+        target: tbl_usr_proveedores_auth
+        cases:
+          vinculacion_existe: { continue_at_step: 3 }
+          email_nuevo: { action: create_user_and_link, continue_at_step: 3 }
+          email_existe_sin_vinculacion:
+            http: 409
+            error_code: CUENTA_EXISTENTE_OTRO_METODO
+            note: "nunca se auto-vincula por coincidencia de email — requiere MOD01-ALG05"
+      - id: 3
+        action: switch_estado
+        same_as: MOD01-ALG02.step5
+      - id: 4
+        action: check_email_verified
+        same_as: MOD01-ALG02.step6
+      - id: 5
+        action: check_mfa_required
+        same_as: MOD01-ALG02.step7
+      - id: 6
+        action: issue_tokens
+        side_effects: [insert_session, emit_audit(LOGIN_GOOGLE), call_if_applicable(MOD01-ALG07)]
+    hard_rule: "nunca crea datos de perfil de Cliente — eso es exclusivo de MOD_02"
+    outputs:
+      success: { http: 200, tokens: [access_token, refresh_token] }
+      errors: [AUTENTICACION_GOOGLE_FALLIDA, CUENTA_EXISTENTE_OTRO_METODO, CUENTA_RECHAZADA, CUENTA_PENDIENTE_DE_APROBACION, EMAIL_NO_VERIFICADO]
+    traceable_requirements: [REQ-ACC-013, REQ-ACC-014, REQ-ACC-015, REQ-ACC-016]
+
+  - algorithm_id: MOD01-ALG04
+    name: verificarSegundoFactor
+    resolution_type: interno_completo
+    called_by: [MOD01-ALG02 (paso 7), MOD01-ALG03 (paso 5)]
+    is_public_endpoint: true
+    external_dependency_in_flow: Redis (challenge storage)
+    inputs:
+      - { name: mfa_challenge_token, type: string, required: true }
+      - { name: codigo, type: string, required: true }
+    steps:
+      - id: 1
+        action: lookup_challenge
+        backend: redis
+        on_fail: { http: 401, error_code: MFA_CHALLENGE_EXPIRADO }
+      - id: 2
+        action: load_secret
+      - id: 3
+        action: verify_totp_or_backup
+        totp_window_seconds: 30
+        max_attempts: 5
+        attempt_window_min: 10
+        on_fail: { http: 401, error_code: CODIGO_MFA_INVALIDO }
+        on_max_exceeded: { http: 429, invalidate_challenge: true }
+      - id: 4
+        action: issue_tokens
+        side_effects: [delete_challenge, emit_audit(VERIFICACION_MFA)]
+    outputs:
+      success: { http: 200, tokens: [access_token, refresh_token] }
+      errors: [MFA_CHALLENGE_EXPIRADO, CODIGO_MFA_INVALIDO, TOO_MANY_REQUESTS]
+    traceable_requirements: [REQ-ACC-017]
+
+  - algorithm_id: MOD01-ALG05
+    name: vincularCuentaGoogle
+    resolution_type: depende_de_respuesta_externa
+    external_dependency: Google OAuth2
+    called_by: [cliente_o_frontend_directamente, requiere_sesion_previa]
+    is_public_endpoint: true
+    precondition: "requiere Access Token válido de una sesión ya autenticada — es la prueba de posesión"
+    inputs:
+      - { name: token_oauth, type: string, required: true }
+    steps:
+      - id: 1
+        action: require_active_session
+      - id: 2
+        action: validate_external
+        provider: google
+      - id: 3
+        action: check_not_linked_elsewhere
+        on_conflict: { http: 409, error_code: PROVEEDOR_YA_VINCULADO_A_OTRA_CUENTA }
+      - id: 4
+        action: insert
+        target: tbl_usr_proveedores_auth
+      - id: 5
+        action: emit_audit
+        tipo_evento: VINCULACION_CUENTA_GOOGLE
+    outputs:
+      success: { http: 200 }
+      errors: [PROVEEDOR_YA_VINCULADO_A_OTRA_CUENTA]
+    traceable_requirements: [REQ-ACC-018, REQ-ACC-019]
+
+  - algorithm_id: MOD01-ALG06
+    name: refreshTokenRTR
+    resolution_type: interno_completo
+    called_by: [cliente_o_frontend_directamente, automatico_al_expirar_access_token]
+    is_public_endpoint: true
+    inputs:
+      - { name: refresh_token, type: string, required: true }
+    steps:
+      - id: 1
+        action: hash_and_lookup
+        target: tbl_ses_sesiones
+        on_fail: { http: 401, error_code: TOKEN_INVALIDO_O_EXPIRADO }
+      - id: 2
+        action: detect_reuse
+        on_reuse_detected:
+          invalidate_all_sessions: true
+          emit_audit: { tipo_evento: SESION_COMPROMETIDA, resultado: FALLO }
+          emit_event: usuario.sesion_comprometida_detectada
+          http: 401
+          error_code: SESION_COMPROMETIDA
+      - id: 3
+        action: rotate
+        invalidate_current: true
+        issue_new_pair: true
+    known_tradeoff_ref: TRADEOFF-001
+    outputs:
+      success: { http: 200, tokens: [access_token, refresh_token] }
+      errors: [TOKEN_INVALIDO_O_EXPIRADO, SESION_COMPROMETIDA]
+    traceable_requirements: [REQ-ACC-020]
+
+  - algorithm_id: MOD01-ALG07
+    name: notificarConversionDeVisitante
+    resolution_type: interno_completo_dispara_evento_externo
+    called_by: [MOD01-ALG02 (condicional), MOD01-ALG03 (condicional), MOD01-ALG04 (condicional)]
+    is_public_endpoint: false
+    inputs:
+      - { name: usr_id_usuario, type: uuid, required: true }
+      - { name: id_sesion_anonima, type: string, required: false }
+    steps:
+      - id: 1
+        action: conditional
+        condition: "id_sesion_anonima presente"
+        if_true: { emit_event: sesion.convertida_en_usuario, target_module: MOD_CARRITO }
+        if_false: { action: no_op, note: "caso normal, no es error" }
+    hard_rule: "este módulo no conoce ni fusiona el carrito — solo notifica"
+    traceable_requirements: [REQ-ACC-021, REQ-ACC-022]
+
+  - algorithm_id: MOD01-ALG08
+    name: validarSecurityContext
+    resolution_type: interno_completo
+    called_by: [cualquier_modulo_protegido, en_cada_request]
+    is_public_endpoint: false
+    note: "middleware, no expuesto directamente al cliente final"
+    inputs:
+      - { name: access_token, type: string, required: true, source: "header Authorization Bearer" }
+    steps:
+      - id: 1
+        action: verify_signature
+        algorithm: RS256
+        on_fail: { http: 401, error_code: TOKEN_INVALIDO_O_EXPIRADO }
+      - id: 2
+        action: extract_context
+        fields: [usr_id_usuario, rol_id_rol, usr_tipo_actor, ten_id_tenant]
+      - id: 3
+        action: conditional
+        condition: "CFG_INTEGRACION_ERP_ACTIVA == true"
+        if_true: { require_tenant_filter: true, on_missing: { http: 400, error_code: CONTEXTO_TENANT_INVALIDO } }
+    note_autorizacion: "este algoritmo NO decide PERMISO_INSUFICIENTE — esa decisión la toma el módulo dueño del recurso protegido, consultando el catálogo de permisos de MOD_22"
+    outputs:
+      success: { context_object: true }
+      errors: [TOKEN_INVALIDO_O_EXPIRADO, CONTEXTO_TENANT_INVALIDO]
+    traceable_requirements: [REQ-ACC-023, REQ-ACC-024]
+
+  - algorithm_id: MOD01-ALG09
+    name: cerrarSesion
+    resolution_type: interno_completo
+    called_by: [cliente_o_frontend_directamente]
+    is_public_endpoint: true
+    inputs:
+      - { name: access_token, type: string, required: true }
+      - { name: refresh_token, type: string, required: true }
+    steps:
+      - id: 1
+        action: validate_and_extract
+        fields: [usr_id_usuario, jti]
+      - id: 2
+        action: invalidate_session
+        target: tbl_ses_sesiones
+      - id: 3
+        action: blacklist_jti
+        backend: redis
+        ttl: tiempo_restante_del_access_token
+    outputs:
+      success: { http: 200 }
+    traceable_requirements: [REQ-ACC-025]
+
+  - algorithm_id: MOD01-ALG10
+    name: resetPassword
+    resolution_type: interno_completo_con_dependencia_email
+    sub_flows:
+      - id: 10a
+        name: solicitarResetPassword
+        called_by: [cliente_o_frontend_directamente]
+        is_public_endpoint: true
+        external_dependency: Servicio de envío de email
+        inputs:
+          - { name: email, type: string, required: true }
+        steps:
+          - id: 1
+            action: lookup_user
+          - id: 2
+            action: conditional
+            condition: "tiene password local"
+            if_true: { generate_token: RESET_PASSWORD, ttl_hours: 1, emit_event: usuario.reset_password_solicitado }
+            if_false: { internal_notification_only: true, note: "cuenta 100% Google" }
+          - id: 3
+            action: always_respond
+            response: { http: 200, generic_message: true }
+            note: "respuesta idéntica exista o no el email — evita enumeración"
+          - id: 4
+            action: emit_audit
+            tipo_evento: SOLICITUD_RESET_PASSWORD
+        outputs:
+          success: { http: 200 }
+        traceable_requirements: [REQ-ACC-026]
+      - id: 10b
+        name: confirmarResetPassword
+        called_by: [cliente_o_frontend_directamente]
+        is_public_endpoint: true
+        inputs:
+          - { name: token_reset, type: string, required: true }
+          - { name: nueva_password, type: string, required: true }
+        steps:
+          - id: 1
+            action: validate_token
+            on_fail: { http: 401, error_code: TOKEN_RESET_INVALIDO_O_EXPIRADO }
+          - id: 2
+            action: validate_password_policy
+            on_fail: { http: 400, error_code: PASSWORD_INSEGURA }
+          - id: 3
+            action: hash_and_update
+          - id: 4
+            action: mark_token_used
+          - id: 5
+            action: invalidate_all_sessions
+          - id: 6
+            action: emit_audit
+            tipo_evento: RESET_PASSWORD_CONFIRMADO
+        outputs:
+          success: { http: 200 }
+          errors: [TOKEN_RESET_INVALIDO_O_EXPIRADO, PASSWORD_INSEGURA]
+        traceable_requirements: [REQ-ACC-027, REQ-ACC-028]
+
+  - algorithm_id: MOD01-ALG11
+    name: verificarEmail
+    resolution_type: interno_completo
+    called_by: [cliente_o_frontend_directamente]
+    is_public_endpoint: true
+    inputs:
+      - { name: token_verificacion, type: string, required: true }
+    steps:
+      - id: 1
+        action: validate_token
+        on_fail: { http: 401, error_code: TOKEN_VERIFICACION_INVALIDO_O_EXPIRADO }
+      - id: 2
+        action: mark_verified
+      - id: 3
+        action: emit_audit
+        tipo_evento: EMAIL_VERIFICADO
+    outputs:
+      success: { http: 200 }
+      errors: [TOKEN_VERIFICACION_INVALIDO_O_EXPIRADO]
+    traceable_requirements: [REQ-ACC-027]
+
+  - algorithm_id: MOD01-ALG12
+    name: registrarEventoAuditoria
+    resolution_type: interno_dispara_evento_externo
+    called_by: [MOD01-ALG01, MOD01-ALG02, MOD01-ALG03, MOD01-ALG04, MOD01-ALG05, MOD01-ALG06, MOD01-ALG10, MOD01-ALG11, MOD01-ALG13]
+    is_public_endpoint: false
+    inputs:
+      - { name: usr_id_usuario, type: uuid, required: false, note: "nullable si el intento falló antes de identificar usuario" }
+      - { name: tipo_evento, type: string, required: true }
+      - { name: entidad_afectada, type: string, required: false }
+      - { name: valor_anterior, type: json, required: false }
+      - { name: valor_nuevo, type: json, required: false }
+      - { name: ip_origen, type: string, required: true }
+      - { name: resultado, type: enum[EXITO, FALLO], required: true }
+    steps:
+      - id: 1
+        action: emit_event
+        target: COMPONENTE_AUDITORIA_INDEPENDIENTE
+        event: auditoria.evento_registrado
+    hard_rule: "este módulo no posee la tabla de auditoría, solo emite el evento"
+    traceable_requirements: [REQ-ACC-029]
+
+  - algorithm_id: MOD01-ALG13
+    name: revocarAccesoPorDesactivacion
+    resolution_type: interno_completo
+    called_by: [MOD_22_PANEL_DE_ADMINISTRACION_Y_PERMISOS]
+    is_public_endpoint: false
+    triggered_by_event: usuario.desactivado
+    inputs:
+      - { name: usr_id_usuario, type: uuid, required: true }
+      - { name: motivo, type: enum[DESACTIVACION_ADMINISTRATIVA, SOSPECHA_COMPROMISO], required: true }
+      - { name: jti_conocido, type: string, required: false }
+    steps:
+      - id: 1
+        action: invalidate_all_sessions
+        target: tbl_ses_sesiones
+      - id: 2
+        action: conditional
+        condition: "jti_conocido presente"
+        if_true: { blacklist_jti: true, backend: redis }
+        if_false:
+          note: >
+            limitación conocida: sin jti conocido, el Access Token vigente
+            sigue siendo válido en su firma hasta expirar (máx. 15 min),
+            pero no podrá renovarse porque su Refresh Token ya fue invalidado
+      - id: 3
+        action: emit_audit
+        tipo_evento: REVOCACION_POR_DESACTIVACION
+    known_tradeoff_ref: TRADEOFF-002
+    outputs:
+      success: { internal_only: true, no_http_response_to_end_user: true }
+    traceable_requirements: [REQ-ACC-031]
+
+# ============================================================================
+# PREGUNTAS SUGERIDAS PARA EL AGENTE REVISOR
+# (para que la revisión no sea pasiva, sino que busque activamente fallas)
+# ============================================================================
+review_prompts_for_reviewing_agent:
+  - "¿Hay algún algoritmo que asuma que otro ya se ejecutó, sin que esa dependencia esté declarada en 'called_by' o 'steps'?"
+  - "¿Hay algún evento emitido en 'emits_events_to' que ningún algoritmo dispara realmente en sus steps?"
+  - "¿Hay algún error listado en 'outputs.errors' de un algoritmo que no tenga un requisito trazable correspondiente?"
+  - "¿La dependencia externa a Google (MOD01-ALG03, MOD01-ALG05) tiene manejo explícito de timeout, o solo de rechazo por token inválido?"
+  - "¿MOD01-ALG13 podría dispararse dos veces para el mismo usr_id_usuario sin causar un error o efecto duplicado no deseado?"
+  - "¿Existe algún camino donde un usuario con MFA habilitado pueda terminar recibiendo tokens sin pasar por MOD01-ALG04?"
